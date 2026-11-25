@@ -1,0 +1,521 @@
+name: Build IPA
+on:
+  workflow_dispatch:
+  push:
+    tags-ignore:
+      - '**'
+    paths:
+      - '.github/workflows/build.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Write sources
+        run: |
+          mkdir -p src
+          cat > src/App.swift <<'SWIFT_EOF'
+          import SwiftUI
+          import WebKit
+          import PhotosUI
+          import Vision
+          import SafariServices
+          import ImageIO
+
+          @MainActor
+          final class Browser: ObservableObject {
+              let web: WKWebView
+              init() {
+                  let c = WKWebViewConfiguration()
+                  c.allowsInlineMediaPlayback = true
+                  let w = WKWebView(frame: .zero, configuration: c)
+                  w.allowsBackForwardNavigationGestures = true
+                  w.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                  web = w
+              }
+              func load(_ s: String) {
+                  guard let u = URL(string: s) else { return }
+                  web.load(URLRequest(url: u))
+              }
+              func loadHTML(_ h: String, base: String) {
+                  web.loadHTMLString(h, baseURL: URL(string: base))
+              }
+          }
+
+          struct WebView: UIViewRepresentable {
+              let web: WKWebView
+              func makeUIView(context: Context) -> WKWebView { web }
+              func updateUIView(_ v: WKWebView, context: Context) {}
+          }
+
+          enum Engine: String, CaseIterable, Identifiable {
+              case google = "Google", bing = "Bing", ddg = "DuckDuckGo", yandex = "Yandex"
+              var id: String { rawValue }
+              func url(_ q: String, images: Bool) -> String {
+                  let ok = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&+=#?"))
+                  let e = q.addingPercentEncoding(withAllowedCharacters: ok) ?? q
+                  switch self {
+                  case .google: return "https://www.google.com/search?q=\(e)" + (images ? "&tbm=isch" : "")
+                  case .bing: return images ? "https://www.bing.com/images/search?q=\(e)" : "https://www.bing.com/search?q=\(e)"
+                  case .ddg: return "https://duckduckgo.com/?q=\(e)" + (images ? "&iax=images&ia=images" : "")
+                  case .yandex: return images ? "https://yandex.com/images/search?text=\(e)" : "https://yandex.com/search/?text=\(e)"
+                  }
+              }
+          }
+
+          enum Reverse: String, CaseIterable, Identifiable {
+              case lens = "Google Lens", tineye = "TinEye", bing = "Bing"
+              var id: String { rawValue }
+              func page(_ b64: String) -> (html: String, base: String) {
+                  let head = "<!doctype html><meta name=viewport content='width=device-width'><body style='font-family:-apple-system;text-align:center;padding:40px'>Görsel gönderiliyor…"
+                  switch self {
+                  case .lens: return (head + fileForm("https://lens.google.com/v3/upload", "encoded_image", b64), "https://lens.google.com")
+                  case .tineye: return (head + fileForm("https://tineye.com/search", "image", b64), "https://tineye.com")
+                  case .bing:
+                      let f = "<form id=f method=POST action='https://www.bing.com/images/search?view=detailv2&iss=sbiupload&FORM=IRSBIQ'><input type=hidden name=imageBin value='\(b64)'></form><script>document.getElementById('f').submit()</script>"
+                      return (head + f, "https://www.bing.com")
+                  }
+              }
+              private func fileForm(_ action: String, _ field: String, _ b64: String) -> String {
+                  return """
+                  <form id=f method=POST enctype=multipart/form-data action='\(action)'><input type=file id=i name='\(field)'></form>
+                  <script>
+                  const b=atob('\(b64)');const a=new Uint8Array(b.length);for(let k=0;k<b.length;k++)a[k]=b.charCodeAt(k);
+                  const d=new DataTransfer();d.items.add(new File([a],'image.jpg',{type:'image/jpeg'}));
+                  document.getElementById('i').files=d.files;document.getElementById('f').submit();
+                  </script>
+                  """
+              }
+          }
+
+          func jpegBase64(_ img: UIImage) -> String {
+              let m: CGFloat = 1400
+              let s = min(1, m / max(img.size.width, img.size.height))
+              let size = CGSize(width: img.size.width * s, height: img.size.height * s)
+              let f = UIGraphicsImageRendererFormat()
+              f.scale = 1
+              let out = UIGraphicsImageRenderer(size: size, format: f).image { _ in
+                  img.draw(in: CGRect(origin: .zero, size: size))
+              }
+              return (out.jpegData(compressionQuality: 0.8) ?? Data()).base64EncodedString()
+          }
+
+          struct PhotoPicker: UIViewControllerRepresentable {
+              var onPick: (UIImage) -> Void
+              func makeUIViewController(context: Context) -> PHPickerViewController {
+                  var c = PHPickerConfiguration()
+                  c.filter = .images
+                  c.selectionLimit = 1
+                  let p = PHPickerViewController(configuration: c)
+                  p.delegate = context.coordinator
+                  return p
+              }
+              func updateUIViewController(_ u: PHPickerViewController, context: Context) {}
+              func makeCoordinator() -> Coord { Coord(onPick) }
+              final class Coord: NSObject, PHPickerViewControllerDelegate {
+                  let onPick: (UIImage) -> Void
+                  init(_ f: @escaping (UIImage) -> Void) { onPick = f }
+                  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+                      picker.dismiss(animated: true)
+                      guard let p = results.first?.itemProvider, p.canLoadObject(ofClass: UIImage.self) else { return }
+                      p.loadObject(ofClass: UIImage.self) { o, _ in
+                          if let i = o as? UIImage { DispatchQueue.main.async { self.onPick(i) } }
+                      }
+                  }
+              }
+          }
+
+          struct SafariView: UIViewControllerRepresentable {
+              let url: URL
+              func makeUIViewController(context: Context) -> SFSafariViewController { SFSafariViewController(url: url) }
+              func updateUIViewController(_ u: SFSafariViewController, context: Context) {}
+          }
+
+          struct Hit: Decodable { var title: String?; var link: String?; var snippet: String? }
+          struct Pic: Decodable { var title: String?; var imageUrl: String?; var thumbnailUrl: String?; var link: String?; var source: String? }
+          struct Resp: Decodable { var organic: [Hit]?; var images: [Pic]? }
+
+          @MainActor
+          final class Store: ObservableObject {
+              @Published var hits: [Hit] = []
+              @Published var pics: [Pic] = []
+              @Published var loading = false
+              @Published var error: String?
+              var query = ""
+              private var webDone = false
+              private var picsDone = false
+
+              func run(_ q: String, tab: Int, key: String) async {
+                  query = q; hits = []; pics = []; webDone = false; picsDone = false; error = nil
+                  await load(tab: tab, key: key)
+              }
+
+              func load(tab: Int, key: String) async {
+                  guard !query.isEmpty else { return }
+                  if tab == 0 && webDone { return }
+                  if tab == 1 && picsDone { return }
+                  loading = true; error = nil
+                  defer { loading = false }
+                  do {
+                      if tab == 0 { hits = try await call("search", key).organic ?? []; webDone = true }
+                      else { pics = try await call("images", key).images ?? []; picsDone = true }
+                  } catch let e as NSError {
+                      if e.domain == "api" {
+                          switch e.code {
+                          case 400, 401, 403: error = "API anahtarı geçersiz ya da kota bitti."
+                          case 429: error = "Çok sık istek gönderildi, biraz bekle."
+                          default: error = "Servis hatası (\(e.code))."
+                          }
+                      } else if e.domain == NSURLErrorDomain {
+                          error = "Bağlantı hatası. İnternetini kontrol et."
+                      } else {
+                          error = "Sonuçlar okunamadı."
+                      }
+                  }
+              }
+
+              private func call(_ kind: String, _ key: String) async throws -> Resp {
+                  var r = URLRequest(url: URL(string: "https://google.serper.dev/\(kind)")!)
+                  r.httpMethod = "POST"
+                  r.setValue(key.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "X-API-KEY")
+                  r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  r.httpBody = try JSONSerialization.data(withJSONObject: ["q": query, "gl": "tr", "hl": "tr"])
+                  let (d, resp) = try await URLSession.shared.data(for: r)
+                  if let h = resp as? HTTPURLResponse, h.statusCode != 200 { throw NSError(domain: "api", code: h.statusCode) }
+                  return try JSONDecoder().decode(Resp.self, from: d)
+              }
+          }
+
+          func cgOrientation(_ o: UIImage.Orientation) -> CGImagePropertyOrientation {
+              switch o {
+              case .up: return .up
+              case .down: return .down
+              case .left: return .left
+              case .right: return .right
+              case .upMirrored: return .upMirrored
+              case .downMirrored: return .downMirrored
+              case .leftMirrored: return .leftMirrored
+              case .rightMirrored: return .rightMirrored
+              @unknown default: return .up
+              }
+          }
+
+          func analyze(_ img: UIImage, done: @escaping ([String]) -> Void) {
+              guard let cg = img.cgImage else { done([]); return }
+              let ori = cgOrientation(img.imageOrientation)
+              DispatchQueue.global(qos: .userInitiated).async {
+                  let h = VNImageRequestHandler(cgImage: cg, orientation: ori, options: [:])
+                  let cls = VNClassifyImageRequest()
+                  let txt = VNRecognizeTextRequest()
+                  txt.recognitionLevel = .accurate
+                  txt.usesLanguageCorrection = true
+                  try? h.perform([cls, txt])
+                  let skip: Set<String> = ["structure", "outdoor", "indoor", "people", "adult", "material", "sky"]
+                  let labels = (cls.results ?? [])
+                      .filter { $0.confidence > 0.3 && !skip.contains($0.identifier) }
+                      .prefix(3).map { $0.identifier.replacingOccurrences(of: "_", with: " ") }
+                  let lines = (txt.results ?? [])
+                      .compactMap { $0.topCandidates(1).first?.string }
+                      .filter { $0.count > 3 }.prefix(3)
+                  var seen = Set<String>()
+                  let out = (Array(lines) + labels).filter { seen.insert($0.lowercased()).inserted }
+                  DispatchQueue.main.async { done(out) }
+              }
+          }
+
+          enum Sheet: Identifiable {
+              case picker, settings, web, page(URL), pic(Pic)
+              var id: String {
+                  switch self {
+                  case .picker: return "picker"
+                  case .settings: return "settings"
+                  case .web: return "web"
+                  case .page(let u): return "page" + u.absoluteString
+                  case .pic(let p): return "pic" + (p.imageUrl ?? p.thumbnailUrl ?? "")
+                  }
+              }
+          }
+
+          @MainActor
+          struct WebSheet: View {
+              @ObservedObject var br: Browser
+              @Environment(\.dismiss) private var dismiss
+              var body: some View {
+                  VStack(spacing: 0) {
+                      HStack(spacing: 20) {
+                          Button { br.web.goBack() } label: { Image(systemName: "chevron.left") }
+                          Button { br.web.goForward() } label: { Image(systemName: "chevron.right") }
+                          Button { br.web.reload() } label: { Image(systemName: "arrow.clockwise") }
+                          Spacer()
+                          Button("Kapat") { dismiss() }
+                      }.padding(12)
+                      WebView(web: br.web)
+                  }
+              }
+          }
+
+          struct SettingsView: View {
+              @Binding var key: String
+              @Environment(\.dismiss) private var dismiss
+              var body: some View {
+                  NavigationView {
+                      Form {
+                          Section(header: Text("Serper API anahtarı"),
+                                  footer: Text("serper.dev’de ücretsiz kayıt ol, panelden API anahtarını kopyalayıp buraya yapıştır. Ücretsiz deneme kotası 2.500 sorgu. Anahtar yalnızca bu cihazda saklanır.")) {
+                              TextField("Anahtar", text: $key)
+                                  .textInputAutocapitalization(.never)
+                                  .disableAutocorrection(true)
+                              Link("serper.dev’i aç", destination: URL(string: "https://serper.dev")!)
+                          }
+                      }
+                      .navigationTitle("Ayarlar")
+                      .toolbar { Button("Bitti") { dismiss() } }
+                  }
+              }
+          }
+
+          struct PicView: View {
+              let p: Pic
+              var body: some View {
+                  VStack(spacing: 12) {
+                      AsyncImage(url: URL(string: p.imageUrl ?? p.thumbnailUrl ?? "")) { ph in
+                          if let i = ph.image { i.resizable().scaledToFit() }
+                          else if ph.error != nil { Text("Görsel yüklenemedi").foregroundColor(.secondary) }
+                          else { ProgressView() }
+                      }
+                      .frame(maxWidth: .infinity, maxHeight: .infinity)
+                      if let t = p.title { Text(t).font(.subheadline).multilineTextAlignment(.center) }
+                      if let l = p.link, let u = URL(string: l) { Link("Kaynak sayfayı aç", destination: u).font(.headline) }
+                  }
+                  .padding()
+              }
+          }
+
+          @MainActor
+          struct ContentView: View {
+              @StateObject private var br = Browser()
+              @StateObject private var store = Store()
+              @AppStorage("serperKey") private var key = ""
+              @State private var q = ""
+              @State private var tab = 0
+              @State private var engine = Engine.google
+              @State private var picked: UIImage?
+              @State private var ideas: [String] = []
+              @State private var rev = Reverse.lens
+              @State private var sheet: Sheet?
+
+              private var hasKey: Bool { !key.trimmingCharacters(in: .whitespaces).isEmpty }
+
+              func search() {
+                  let t = q.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard !t.isEmpty else { return }
+                  UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                  if hasKey {
+                      Task { await store.run(t, tab: tab, key: key) }
+                  } else {
+                      br.load(engine.url(t, images: tab == 1))
+                      sheet = .web
+                  }
+              }
+              func openPage(_ s: String?) {
+                  if let s = s, let u = URL(string: s), u.scheme?.hasPrefix("http") == true { sheet = .page(u) }
+              }
+              func reverseSearch() {
+                  guard let p = picked else { return }
+                  let r = rev.page(jpegBase64(p))
+                  br.loadHTML(r.html, base: r.base)
+                  sheet = .web
+              }
+              func pick(_ img: UIImage) {
+                  picked = img
+                  ideas = []
+                  analyze(img) { ideas = $0 }
+              }
+
+              var body: some View {
+                  VStack(spacing: 8) {
+                      searchBar
+                      modeBar
+                      if picked != nil { pickedBar }
+                      results
+                  }
+                  .padding(.horizontal, 12).padding(.top, 8)
+                  .sheet(item: $sheet) { s in
+                      switch s {
+                      case .picker: PhotoPicker { img in pick(img) }
+                      case .settings: SettingsView(key: $key)
+                      case .web: WebSheet(br: br)
+                      case .page(let u): SafariView(url: u).ignoresSafeArea()
+                      case .pic(let p): PicView(p: p)
+                      }
+                  }
+                  .onChange(of: tab) { _ in
+                      if hasKey { Task { await store.load(tab: tab, key: key) } }
+                  }
+              }
+
+              private var searchBar: some View {
+                  HStack {
+                      TextField("Ne aramak istiyorsun?", text: $q)
+                          .textFieldStyle(.roundedBorder)
+                          .submitLabel(.search)
+                          .onSubmit { search() }
+                      Button("Ara") { search() }.buttonStyle(.borderedProminent)
+                      Button { sheet = .settings } label: { Image(systemName: "gearshape") }
+                  }
+              }
+
+              private var modeBar: some View {
+                  VStack(spacing: 8) {
+                      if hasKey {
+                          Picker("", selection: $tab) {
+                              Text("Web").tag(0)
+                              Text("Görseller").tag(1)
+                          }.pickerStyle(.segmented)
+                      } else {
+                          Picker("", selection: $engine) {
+                              ForEach(Engine.allCases) { Text($0.rawValue).tag($0) }
+                          }.pickerStyle(.segmented)
+                          Toggle("Görsel sonuçlar", isOn: Binding(get: { tab == 1 }, set: { tab = $0 ? 1 : 0 }))
+                      }
+                      Button { sheet = .picker } label: { Label("Görselle ara", systemImage: "photo") }
+                          .frame(maxWidth: .infinity, alignment: .trailing)
+                  }
+              }
+
+              private var pickedBar: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      HStack(spacing: 10) {
+                          if let p = picked {
+                              Image(uiImage: p).resizable().scaledToFill()
+                                  .frame(width: 52, height: 52).clipped().cornerRadius(8)
+                          }
+                          Picker("", selection: $rev) {
+                              ForEach(Reverse.allCases) { Text($0.rawValue).tag($0) }
+                          }.pickerStyle(.segmented)
+                          Button("Eşleştir") { reverseSearch() }.buttonStyle(.borderedProminent)
+                      }
+                      if !ideas.isEmpty {
+                          ScrollView(.horizontal, showsIndicators: false) {
+                              HStack {
+                                  ForEach(ideas, id: \.self) { s in
+                                      Button(s) { q = s; search() }.buttonStyle(.bordered)
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              @ViewBuilder private var results: some View {
+                  if !hasKey {
+                      VStack(spacing: 10) {
+                          Spacer()
+                          Text("API anahtarı eklersen sonuçlar burada, uygulamanın içinde listelenir.\nŞimdilik aramalar tarayıcı penceresinde açılır.")
+                              .multilineTextAlignment(.center).foregroundColor(.secondary)
+                          Button("API anahtarı ekle") { sheet = .settings }.buttonStyle(.bordered)
+                          Spacer()
+                      }.frame(maxWidth: .infinity)
+                  } else if store.loading {
+                      ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+                  } else if let e = store.error {
+                      Text(e).foregroundColor(.red).multilineTextAlignment(.center)
+                          .frame(maxWidth: .infinity, maxHeight: .infinity)
+                  } else if store.query.isEmpty {
+                      Text("Yaz ve ara, ya da bir görsel seç.").foregroundColor(.secondary)
+                          .frame(maxWidth: .infinity, maxHeight: .infinity)
+                  } else if tab == 0 {
+                      webList
+                  } else {
+                      imageGrid
+                  }
+              }
+
+              private var webList: some View {
+                  ScrollView {
+                      LazyVStack(alignment: .leading, spacing: 16) {
+                          ForEach(store.hits.indices, id: \.self) { i in
+                              let h = store.hits[i]
+                              Button { openPage(h.link) } label: {
+                                  VStack(alignment: .leading, spacing: 3) {
+                                      Text(URL(string: h.link ?? "")?.host ?? "").font(.caption).foregroundColor(.secondary)
+                                      Text(h.title ?? "").font(.headline).foregroundColor(.blue)
+                                      Text(h.snippet ?? "").font(.subheadline).foregroundColor(.primary)
+                                  }
+                                  .frame(maxWidth: .infinity, alignment: .leading)
+                              }.buttonStyle(.plain)
+                          }
+                          if store.hits.isEmpty { Text("Sonuç bulunamadı.").foregroundColor(.secondary) }
+                      }.padding(.vertical, 6)
+                  }
+              }
+
+              private var imageGrid: some View {
+                  let cols = [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)]
+                  return ScrollView {
+                      LazyVGrid(columns: cols, spacing: 6) {
+                          ForEach(store.pics.indices, id: \.self) { i in
+                              let p = store.pics[i]
+                              Button { sheet = .pic(p) } label: {
+                                  Color.gray.opacity(0.12).frame(height: 140)
+                                      .overlay(
+                                          AsyncImage(url: URL(string: p.thumbnailUrl ?? p.imageUrl ?? "")) { ph in
+                                              if let img = ph.image { img.resizable().scaledToFill() } else { EmptyView() }
+                                          }
+                                      )
+                                      .clipped().cornerRadius(8)
+                              }.buttonStyle(.plain)
+                          }
+                      }
+                      if store.pics.isEmpty { Text("Görsel bulunamadı.").foregroundColor(.secondary).padding() }
+                  }
+              }
+          }
+
+          @main
+          struct NetAramaApp: App {
+              var body: some Scene { WindowGroup { ContentView() } }
+          }
+          SWIFT_EOF
+          cat > src/Info.plist <<'PLIST_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          <key>CFBundleExecutable</key><string>NetArama</string>
+          <key>CFBundleIdentifier</key><string>com.netarama.app</string>
+          <key>CFBundleName</key><string>Net Arama</string>
+          <key>CFBundleDisplayName</key><string>Net Arama</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>1.1</string>
+          <key>CFBundleVersion</key><string>2</string>
+          <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+          <key>MinimumOSVersion</key><string>15.0</string>
+          <key>UIDeviceFamily</key><array><integer>1</integer></array>
+          <key>UILaunchScreen</key><dict/>
+          <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+          <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+          </dict>
+          </plist>
+          PLIST_EOF
+      - name: Build IPA
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP=build/Payload/NetArama.app
+          mkdir -p "$APP"
+          xcrun swiftc -parse-as-library -swift-version 5 -O -sdk "$SDK" -target arm64-apple-ios15.0 -o "$APP/NetArama" src/App.swift
+          cp src/Info.plist "$APP/Info.plist"
+          cd build && zip -qr NetArama.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetArama-ipa
+          path: build/NetArama.ipa
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG=net-arama-latest
+          gh release delete "$TAG" --cleanup-tag -y || true
+          gh release create "$TAG" build/NetArama.ipa --title "Net Arama (son sürüm)" --notes "Her derlemede güncellenir. ESign ile bu IPA dosyasını içe aktar."
